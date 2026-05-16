@@ -1,9 +1,8 @@
 """
 Pembrokeshire Islands Boat Trips - Availability Checker
 ========================================================
-Uses Chrome DevTools Protocol (CDP) to intercept the network
-requests FareHarbor's own JavaScript makes to fetch availability,
-then reads the response data directly.
+Calls FareHarbor's internal calendar API directly — no browser needed.
+Fast, lightweight, and uses very few GitHub Actions minutes.
 
 Credentials are read from environment variables (GitHub Secrets).
 """
@@ -11,16 +10,11 @@ Credentials are read from environment variables (GitHub Secrets).
 import json
 import smtplib
 import os
-import time
-import threading
+import urllib.request
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-import urllib.request
-import urllib.parse
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
 # ============================================================
 # CONFIGURATION
@@ -46,112 +40,65 @@ BOOKING_URL = (
 STATE_FILE = "alerted_dates.json"
 
 # ============================================================
-# BROWSER SETUP WITH NETWORK LOGGING
-# ============================================================
-
-def make_driver():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,900")
-    # Enable performance logging to capture network requests
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    driver = webdriver.Chrome(options=options)
-    # Enable CDP network tracking
-    driver.execute_cdp_cmd("Network.enable", {})
-    return driver
-
-
-def get_network_responses(driver):
-    """Extract all network response URLs and bodies from performance logs."""
-    logs = driver.get_log("performance")
-    responses = []
-    for entry in logs:
-        try:
-            msg = json.loads(entry["message"])["message"]
-            if msg.get("method") == "Network.responseReceived":
-                url = msg["params"]["response"]["url"]
-                request_id = msg["params"]["requestId"]
-                responses.append((url, request_id))
-        except Exception:
-            pass
-    return responses
-
-
-def get_response_body(driver, request_id):
-    """Get the response body for a given request ID via CDP."""
-    try:
-        result = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
-        return result.get("body", "")
-    except Exception:
-        return ""
-
-
-# ============================================================
 # AVAILABILITY CHECKING
 # ============================================================
 
-def check_month(driver, year, month):
+def fetch_available_dates(year, month):
+    """
+    Call FareHarbor's internal calendar API for a given month.
+    Returns a list of date strings (YYYY-MM-DD) that have availability.
+    """
     url = (
-        f"https://fareharbor.com/embeds/book/pembrokeshire-islands/items/291353/"
-        f"calendar/{year}/{month:02d}/"
-        f"?full-items=yes&back=https://www.pembrokeshire-islands.co.uk/boat-trips/"
-        f"&flow=554483"
+        f"https://fareharbor.com/api/v1/companies/pembrokeshire-islands/"
+        f"items/291353/calendar/{year}/{month:02d}/"
+        f"?allow_grouped=yes&bookable_only=no&asn=&path=1&is_fh_app=no"
     )
-    print(f"  Loading: {url}")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://fareharbor.com/embeds/book/pembrokeshire-islands/",
+        "Accept": "application/json",
+    }
 
-    # Clear logs before loading
-    driver.get("about:blank")
-    time.sleep(1)
-    driver.get_log("performance")  # flush old logs
-
-    driver.get(url)
-
-    # Wait for the page to make its API calls
-    print("  Waiting for API calls to complete...")
-    time.sleep(15)
-
-    # Scan all network requests for availability data
-    responses = get_network_responses(driver)
-    print(f"  Captured {len(responses)} network responses")
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"  [ERROR] Could not fetch {year}-{month:02d}: {e}")
+        return []
 
     available_dates = []
+    weeks = data.get("calendar", {}).get("weeks", [])
+    for week in weeks:
+        for day in week.get("days", []):
+            # Only count days in the current month
+            if day.get("month") != "current":
+                continue
+            date_str = day.get("at", "")
+            count = day.get("count", 0)
+            is_bookable = day.get("is_bookable", False)
+            availabilities = day.get("availabilities", [])
 
-    for resp_url, request_id in responses:
-        # Look for FareHarbor availability API calls
-        if "availabilit" in resp_url.lower() or ("fareharbor" in resp_url and "item" in resp_url):
-            print(f"  Interesting URL: {resp_url}")
-            body = get_response_body(driver, request_id)
-            if body:
-                print(f"  Response body (first 500 chars): {body[:500]}")
-                try:
-                    data = json.loads(body)
-                    # Extract available dates from the response
-                    availabilities = data.get("availabilities", [])
-                    for a in availabilities:
-                        capacity = a.get("capacity", 0)
-                        start_at = a.get("start_at", "")
-                        if capacity > 0 and start_at:
-                            day = start_at[:10]
-                            available_dates.append(day)
-                            print(f"    Available: {day} (capacity: {capacity})")
-                except json.JSONDecodeError:
-                    pass
+            # A day is available if it has availabilities with remaining capacity
+            has_capacity = False
+            for a in availabilities:
+                if a.get("capacity", 0) > 0:
+                    has_capacity = True
+                    break
 
-    # Also print ALL captured URLs for debugging if nothing found
-    if not available_dates:
-        print("  No availability found in intercepted requests.")
-        print("  All captured URLs:")
-        for resp_url, _ in responses[:30]:
-            print(f"    {resp_url}")
+            if count > 0 and has_capacity:
+                available_dates.append(date_str)
+                print(f"  Available: {date_str} ({count} slot(s))")
 
-    return sorted(set(available_dates))
+    return available_dates
 
 
 # ============================================================
-# ALERTS
+# STATE TRACKING
 # ============================================================
 
 def load_alerted_dates():
@@ -165,6 +112,10 @@ def save_alerted_dates(alerted):
     with open(STATE_FILE, "w") as f:
         json.dump(list(alerted), f)
 
+
+# ============================================================
+# ALERTS
+# ============================================================
 
 def send_email(subject, body):
     try:
@@ -233,20 +184,15 @@ def main():
     alerted_dates = load_alerted_dates()
     newly_found = set()
 
-    driver = make_driver()
-    try:
-        for year, month in MONTHS_TO_CHECK:
-            print(f"\nChecking {year}-{month:02d}...")
-            available = check_month(driver, year, month)
-            if available:
-                print(f"  Found available dates: {available}")
-                for d in available:
-                    if d not in alerted_dates:
-                        newly_found.add(d)
-            else:
-                print(f"  No availability found.")
-    finally:
-        driver.quit()
+    for year, month in MONTHS_TO_CHECK:
+        print(f"\nChecking {year}-{month:02d}...")
+        available = fetch_available_dates(year, month)
+        if available:
+            for d in available:
+                if d not in alerted_dates:
+                    newly_found.add(d)
+        else:
+            print(f"  No availability found.")
 
     if newly_found:
         print(f"\nNew dates found — sending alerts...")
