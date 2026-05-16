@@ -1,20 +1,27 @@
 """
 Pembrokeshire Islands Boat Trips - Availability Checker
 ========================================================
-Checks FareHarbor's API directly for June & July 2026 availability
-and sends email + Pushover alerts when slots open up.
+Uses Selenium to load the FareHarbor booking calendar in a real
+browser, wait for JavaScript to render, then reads available dates.
 
 Credentials are read from environment variables (GitHub Secrets).
 """
 
-import urllib.request
-import urllib.parse
 import json
 import smtplib
 import os
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
+import urllib.request
+import urllib.parse
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # ============================================================
 # CONFIGURATION — read from environment variables (GitHub Secrets)
@@ -26,28 +33,116 @@ ALERT_EMAIL_TO     = os.environ["ALERT_EMAIL_TO"]
 PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
 PUSHOVER_API_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
 
-# FareHarbor details (extracted from the booking URL)
-COMPANY = "pembrokeshire-islands"
-ITEM_ID = "291353"
-
-# Date ranges to monitor — (start_date, end_date) as strings YYYY-MM-DD
-DATE_RANGES = [
-    ("2026-06-01", "2026-06-30"),
-    ("2026-07-01", "2026-07-31"),
+# Months to check — (year, month)
+MONTHS_TO_CHECK = [
+    (2026, 6),
+    (2026, 7),
 ]
 
-# Booking URL to include in alerts
 BOOKING_URL = (
     "https://fareharbor.com/embeds/book/pembrokeshire-islands/items/291353/"
     "calendar/2026/06/?full-items=yes"
     "&back=https://www.pembrokeshire-islands.co.uk/boat-trips/&flow=554483"
 )
 
-# File to track which dates we've already alerted about
 STATE_FILE = "alerted_dates.json"
 
 # ============================================================
-# CORE FUNCTIONS
+# SELENIUM BROWSER SETUP
+# ============================================================
+
+def make_driver():
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    driver = webdriver.Chrome(options=options)
+    return driver
+
+
+# ============================================================
+# AVAILABILITY CHECKING
+# ============================================================
+
+def check_month(driver, year, month):
+    """
+    Load the FareHarbor calendar for a given month and return
+    a list of date strings (YYYY-MM-DD) that show as available (green).
+    """
+    url = (
+        f"https://fareharbor.com/embeds/book/pembrokeshire-islands/items/291353/"
+        f"calendar/{year}/{month:02d}/"
+        f"?full-items=yes&back=https://www.pembrokeshire-islands.co.uk/boat-trips/"
+        f"&flow=554483"
+    )
+    print(f"  Loading: {url}")
+    driver.get(url)
+
+    # Wait up to 20 seconds for the calendar to appear
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".fh-calendar, [class*='calendar'], table"))
+        )
+    except Exception:
+        print("  [WARN] Timed out waiting for calendar — trying anyway")
+
+    # Give JS a moment to fully render the date colours
+    time.sleep(3)
+
+    available_dates = []
+
+    # FareHarbor marks available days with an 'available' class on the cell.
+    # Try several selector patterns to be robust across widget versions.
+    selectors = [
+        "td.available",
+        "td[class*='available']",
+        "div[class*='available']",
+        "button[class*='available']",
+        "[data-available='true']",
+        ".CalendarMonth_day--highlighted",
+    ]
+
+    for selector in selectors:
+        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+        if elements:
+            print(f"  Found {len(elements)} available element(s) with selector: {selector}")
+            for el in elements:
+                # Try to get the date from common attributes
+                for attr in ["data-date", "data-day", "aria-label", "title"]:
+                    val = el.get_attribute(attr)
+                    if val and len(val) >= 10:
+                        # Extract YYYY-MM-DD if present
+                        import re
+                        match = re.search(r'(\d{4}-\d{2}-\d{2})', val)
+                        if match:
+                            available_dates.append(match.group(1))
+                            break
+                        # Try parsing a date like "28" from the cell text + known year/month
+                        text = el.text.strip()
+                        if text.isdigit() and 1 <= int(text) <= 31:
+                            available_dates.append(f"{year}-{month:02d}-{int(text):02d}")
+                            break
+                else:
+                    # No date attribute — use cell text if it's a day number
+                    text = el.text.strip()
+                    if text.isdigit() and 1 <= int(text) <= 31:
+                        available_dates.append(f"{year}-{month:02d}-{int(text):02d}")
+            break  # Stop trying selectors once one works
+
+    # Deduplicate and sort
+    result = sorted(set(available_dates))
+    return result
+
+
+# ============================================================
+# ALERTS
 # ============================================================
 
 def load_alerted_dates():
@@ -60,52 +155,6 @@ def load_alerted_dates():
 def save_alerted_dates(alerted):
     with open(STATE_FILE, "w") as f:
         json.dump(list(alerted), f)
-
-
-def fetch_availabilities(start_date, end_date):
-    """
-    Query FareHarbor's availability API for a date range.
-    This is the same endpoint the booking widget uses to show green/grey dates.
-    Returns a list of availability objects, or empty list on error.
-    """
-    url = (
-        f"https://fareharbor.com/api/external/v1/companies/{COMPANY}/"
-        f"items/{ITEM_ID}/availabilities/date-range/{start_date}/{end_date}/"
-        f"?flow=554483"
-    )
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json",
-        "Referer": "https://fareharbor.com/embeds/book/pembrokeshire-islands/",
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("availabilities", [])
-    except Exception as e:
-        print(f"  [ERROR] Could not fetch {start_date} to {end_date}: {e}")
-        return []
-
-
-def extract_available_dates(availabilities):
-    """
-    From a list of availability objects, return dates that have capacity > 0.
-    Each availability has a 'start_at' like '2026-07-28T09:00:00+01:00'
-    and 'capacity' for remaining spots.
-    """
-    available_dates = set()
-    for a in availabilities:
-        capacity = a.get("capacity", 0)
-        start_at = a.get("start_at", "")
-        if capacity > 0 and start_at:
-            day = start_at[:10]  # e.g. '2026-07-28'
-            available_dates.add(day)
-    return sorted(available_dates)
 
 
 def send_email(subject, body):
@@ -175,22 +224,20 @@ def main():
     alerted_dates = load_alerted_dates()
     newly_found = set()
 
-    for start_date, end_date in DATE_RANGES:
-        print(f"\nChecking {start_date} to {end_date}...")
-        availabilities = fetch_availabilities(start_date, end_date)
-
-        if availabilities is None:
-            continue
-
-        available = extract_available_dates(availabilities)
-
-        if available:
-            print(f"  Found available dates: {available}")
-            for d in available:
-                if d not in alerted_dates:
-                    newly_found.add(d)
-        else:
-            print(f"  No availability found.")
+    driver = make_driver()
+    try:
+        for year, month in MONTHS_TO_CHECK:
+            print(f"\nChecking {year}-{month:02d}...")
+            available = check_month(driver, year, month)
+            if available:
+                print(f"  Found available dates: {available}")
+                for d in available:
+                    if d not in alerted_dates:
+                        newly_found.add(d)
+            else:
+                print(f"  No availability found.")
+    finally:
+        driver.quit()
 
     if newly_found:
         print(f"\nNew dates found — sending alerts...")
