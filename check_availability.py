@@ -1,5 +1,5 @@
 """
-Pembrokeshire Islands Boat Trips - Availability Checker
+Pembrokeshire Islands Boat Trips - Availability Checker 
 ========================================================
 Calls FareHarbor's internal calendar API directly — no browser needed.
 Fast, lightweight, and uses very few GitHub Actions minutes.
