@@ -83,11 +83,7 @@ def fetch_available_dates(year, month):
             is_bookable = day.get("is_bookable", False)
             availabilities = day.get("availabilities", [])
 
-            # Debug: print any day that has a non-zero count regardless of month
-            if count > 0:
-                print(f"  [DEBUG] date={date_str} month={day.get('month')} count={count} bookable={is_bookable}")
-
-            if count > 0 and day.get("month") == "current":
+            if count > 0 and day.get("month") == "current" and is_bookable:
                 available_dates.append(date_str)
                 print(f"  Available: {date_str} ({count} slot(s))")
 
