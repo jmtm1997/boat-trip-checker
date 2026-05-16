@@ -174,26 +174,22 @@ def send_alert(new_dates):
 def main():
     print(f"\n=== Availability check started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===")
 
-    alerted_dates = load_alerted_dates()
-    newly_found = set()
+    found = set()
 
     for year, month in MONTHS_TO_CHECK:
         print(f"\nChecking {year}-{month:02d}...")
         available = fetch_available_dates(year, month)
         if available:
             for d in available:
-                if d not in alerted_dates:
-                    newly_found.add(d)
+                found.add(d)
         else:
             print(f"  No availability found.")
 
-    if newly_found:
-        print(f"\nNew dates found — sending alerts...")
-        send_alert(newly_found)
-        alerted_dates.update(newly_found)
-        save_alerted_dates(alerted_dates)
+    if found:
+        print(f"\nDates found — sending alerts...")
+        send_alert(found)
     else:
-        print("\nNo new availability. No alerts sent.")
+        print("\nNo availability. No alerts sent.")
 
     print("=== Check complete ===\n")
 
