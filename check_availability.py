@@ -1,8 +1,9 @@
 """
 Pembrokeshire Islands Boat Trips - Availability Checker
 ========================================================
-Waits for Angular to finish rendering the calendar before
-reading available dates.
+Uses Chrome DevTools Protocol (CDP) to intercept the network
+requests FareHarbor's own JavaScript makes to fetch availability,
+then reads the response data directly.
 
 Credentials are read from environment variables (GitHub Secrets).
 """
@@ -11,6 +12,7 @@ import json
 import smtplib
 import os
 import time
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -18,13 +20,10 @@ import urllib.request
 import urllib.parse
 
 from selenium import webdriver
-from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ============================================================
-# CONFIGURATION — read from environment variables (GitHub Secrets)
+# CONFIGURATION
 # ============================================================
 
 GMAIL_ADDRESS      = os.environ["GMAIL_ADDRESS"]
@@ -47,7 +46,7 @@ BOOKING_URL = (
 STATE_FILE = "alerted_dates.json"
 
 # ============================================================
-# BROWSER SETUP
+# BROWSER SETUP WITH NETWORK LOGGING
 # ============================================================
 
 def make_driver():
@@ -57,45 +56,37 @@ def make_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1280,900")
+    # Enable performance logging to capture network requests
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     driver = webdriver.Chrome(options=options)
+    # Enable CDP network tracking
+    driver.execute_cdp_cmd("Network.enable", {})
     return driver
 
 
-# ============================================================
-# WAIT FOR ANGULAR TO FINISH RENDERING
-# ============================================================
+def get_network_responses(driver):
+    """Extract all network response URLs and bodies from performance logs."""
+    logs = driver.get_log("performance")
+    responses = []
+    for entry in logs:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg.get("method") == "Network.responseReceived":
+                url = msg["params"]["response"]["url"]
+                request_id = msg["params"]["requestId"]
+                responses.append((url, request_id))
+        except Exception:
+            pass
+    return responses
 
-def wait_for_angular(driver, timeout=30):
-    """
-    Wait until Angular has finished rendering by checking that:
-    1. The ng-cloak class has been removed from the html element
-    2. At least one <td> has a non-empty class (meaning availability colours applied)
-    """
-    # First wait for ng-cloak to be removed (Angular's signal that it's bootstrapped)
+
+def get_response_body(driver, request_id):
+    """Get the response body for a given request ID via CDP."""
     try:
-        WebDriverWait(driver, timeout).until_not(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "[ng-cloak], .ng-cloak"))
-        )
-        print("  Angular bootstrapped (ng-cloak removed)")
+        result = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
+        return result.get("body", "")
     except Exception:
-        print("  Timed out waiting for ng-cloak removal — continuing anyway")
-
-    # Then wait until at least one td has a class (availability colours applied)
-    print("  Waiting for availability colours to render...")
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        tds = driver.find_elements(By.TAG_NAME, "td")
-        classes_found = [td.get_attribute("class") for td in tds if td.get_attribute("class")]
-        if classes_found:
-            print(f"  Calendar rendered — found td classes: {classes_found[:5]}")
-            return True
-        time.sleep(1)
-
-    print("  Timed out waiting for calendar colours — dumping td classes for debug:")
-    tds = driver.find_elements(By.TAG_NAME, "td")
-    for td in tds[:10]:
-        print(f"    text={td.text.strip()!r} class={td.get_attribute('class')!r}")
-    return False
+        return ""
 
 
 # ============================================================
@@ -110,89 +101,53 @@ def check_month(driver, year, month):
         f"&flow=554483"
     )
     print(f"  Loading: {url}")
+
+    # Clear logs before loading
+    driver.get("about:blank")
+    time.sleep(1)
+    driver.get_log("performance")  # flush old logs
+
     driver.get(url)
 
-    rendered = wait_for_angular(driver, timeout=45)
+    # Wait for the page to make its API calls
+    print("  Waiting for API calls to complete...")
+    time.sleep(15)
+
+    # Scan all network requests for availability data
+    responses = get_network_responses(driver)
+    print(f"  Captured {len(responses)} network responses")
 
     available_dates = []
 
-    # Dump all td classes so we can see exactly what FareHarbor uses
-    tds = driver.find_elements(By.TAG_NAME, "td")
-    print(f"  Total td elements: {len(tds)}")
-    unique_classes = set()
-    for td in tds:
-        cls = td.get_attribute("class") or ""
-        if cls:
-            unique_classes.add(cls)
+    for resp_url, request_id in responses:
+        # Look for FareHarbor availability API calls
+        if "availabilit" in resp_url.lower() or ("fareharbor" in resp_url and "item" in resp_url):
+            print(f"  Interesting URL: {resp_url}")
+            body = get_response_body(driver, request_id)
+            if body:
+                print(f"  Response body (first 500 chars): {body[:500]}")
+                try:
+                    data = json.loads(body)
+                    # Extract available dates from the response
+                    availabilities = data.get("availabilities", [])
+                    for a in availabilities:
+                        capacity = a.get("capacity", 0)
+                        start_at = a.get("start_at", "")
+                        if capacity > 0 and start_at:
+                            day = start_at[:10]
+                            available_dates.append(day)
+                            print(f"    Available: {day} (capacity: {capacity})")
+                except json.JSONDecodeError:
+                    pass
 
-    if unique_classes:
-        print(f"  Unique td classes found: {unique_classes}")
-    else:
-        print("  No td classes found at all — Angular may not have rendered")
+    # Also print ALL captured URLs for debugging if nothing found
+    if not available_dates:
+        print("  No availability found in intercepted requests.")
+        print("  All captured URLs:")
+        for resp_url, _ in responses[:30]:
+            print(f"    {resp_url}")
 
-    # Look for available dates using JavaScript to inspect the Angular scope
-    # FareHarbor's Angular app stores availability data in the page's JS scope
-    try:
-        result = driver.execute_script("""
-            // Try to find availability data in Angular scope or window variables
-            var results = [];
-
-            // Check window for any fh or fareharbor variables
-            for (var key in window) {
-                if (key.toLowerCase().includes('avail') || key.toLowerCase().includes('fh')) {
-                    try {
-                        results.push(key + ': ' + JSON.stringify(window[key]).substring(0, 200));
-                    } catch(e) {}
-                }
-            }
-
-            // Also try to get Angular scope data from the root element
-            try {
-                var el = document.querySelector('[ng-app], [data-ng-app]');
-                if (el) {
-                    var scope = angular.element(el).scope();
-                    results.push('angular_scope_keys: ' + JSON.stringify(Object.keys(scope)));
-                }
-            } catch(e) {
-                results.push('angular_scope_error: ' + e.message);
-            }
-
-            return results;
-        """)
-        print(f"\n  JS scope data: {result[:10]}")
-    except Exception as e:
-        print(f"  JS execution error: {e}")
-
-    # Try reading available dates from td background colour via JS
-    try:
-        coloured_tds = driver.execute_script("""
-            var results = [];
-            var tds = document.querySelectorAll('td');
-            tds.forEach(function(td) {
-                var style = window.getComputedStyle(td);
-                var bg = style.backgroundColor;
-                var cls = td.className;
-                var txt = td.innerText.trim();
-                if (txt && txt.match(/^\\d+$/)) {
-                    results.push({text: txt, bg: bg, cls: cls});
-                }
-            });
-            return results;
-        """)
-        print(f"\n  TD colour data (first 10): {coloured_tds[:10]}")
-
-        # Green background = available. FareHarbor uses approximately rgb(34, 139, 34) or similar
-        for td_data in coloured_tds:
-            bg = td_data.get('bg', '')
-            txt = td_data.get('text', '')
-            cls = td_data.get('cls', '')
-            # Print all so we can see what colours are used
-            print(f"    day={txt} bg={bg} cls={cls}")
-
-    except Exception as e:
-        print(f"  Colour detection error: {e}")
-
-    return available_dates
+    return sorted(set(available_dates))
 
 
 # ============================================================
@@ -289,7 +244,7 @@ def main():
                     if d not in alerted_dates:
                         newly_found.add(d)
             else:
-                print(f"  No availability detected yet.")
+                print(f"  No availability found.")
     finally:
         driver.quit()
 
