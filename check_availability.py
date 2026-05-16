@@ -26,18 +26,28 @@ ALERT_EMAIL_TO     = os.environ["ALERT_EMAIL_TO"]
 PUSHOVER_USER_KEY  = os.environ["PUSHOVER_USER_KEY"]
 PUSHOVER_API_TOKEN = os.environ["PUSHOVER_API_TOKEN"]
 
+# Months to fetch from the API
 MONTHS_TO_CHECK = [
+    (2026, 5),
     (2026, 6),
     (2026, 7),
 ]
 
-BOOKING_URL = (
-    "https://fareharbor.com/embeds/book/pembrokeshire-islands/items/291353/"
-    "calendar/2026/06/?full-items=yes"
-    "&back=https://www.pembrokeshire-islands.co.uk/boat-trips/&flow=554483"
+# Only alert on these specific dates
+DATES_TO_WATCH = set(
+    # Specific May dates
+    ["2026-05-22", "2026-05-23", "2026-05-24", "2026-05-30", "2026-05-31"]
+    # All of June
+    + [f"2026-06-{d:02d}" for d in range(1, 31)]
+    # July 1st to 26th
+    + [f"2026-07-{d:02d}" for d in range(1, 27)]
 )
 
-STATE_FILE = "alerted_dates.json"
+BOOKING_URL = (
+    "https://fareharbor.com/embeds/book/pembrokeshire-islands/items/291353/"
+    "calendar/2026/05/?full-items=yes"
+    "&back=https://www.pembrokeshire-islands.co.uk/boat-trips/&flow=554483"
+)
 
 # ============================================================
 # AVAILABILITY CHECKING
@@ -46,7 +56,7 @@ STATE_FILE = "alerted_dates.json"
 def fetch_available_dates(year, month):
     """
     Call FareHarbor's internal calendar API for a given month.
-    Returns a list of date strings (YYYY-MM-DD) that have availability.
+    Returns a list of date strings (YYYY-MM-DD) that are bookable.
     """
     url = (
         f"https://fareharbor.com/api/v1/companies/pembrokeshire-islands/"
@@ -75,35 +85,17 @@ def fetch_available_dates(year, month):
     weeks = data.get("calendar", {}).get("weeks", [])
     for week in weeks:
         for day in week.get("days", []):
-            # Only count days in the current month
             if day.get("month") != "current":
                 continue
             date_str = day.get("at", "")
             count = day.get("count", 0)
             is_bookable = day.get("is_bookable", False)
-            availabilities = day.get("availabilities", [])
 
-            if count > 0 and day.get("month") == "current" and is_bookable:
+            if count > 0 and is_bookable and date_str in DATES_TO_WATCH:
                 available_dates.append(date_str)
                 print(f"  Available: {date_str} ({count} slot(s))")
 
     return available_dates
-
-
-# ============================================================
-# STATE TRACKING
-# ============================================================
-
-def load_alerted_dates():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
-
-
-def save_alerted_dates(alerted):
-    with open(STATE_FILE, "w") as f:
-        json.dump(list(alerted), f)
 
 
 # ============================================================
@@ -150,20 +142,20 @@ def send_pushover(title, message):
         print(f"  [ERROR] Pushover failed: {e}")
 
 
-def send_alert(new_dates):
-    date_list = "\n".join(f"  • {d}" for d in sorted(new_dates))
-    subject = f"🚤 Pembrokeshire boat trip tickets available! ({len(new_dates)} date(s))"
+def send_alert(dates):
+    date_list = "\n".join(f"  • {d}" for d in sorted(dates))
+    subject = f"🚤 Pembrokeshire boat trip tickets available! ({len(dates)} date(s))"
     body = (
         f"Good news! Tickets are now available for the following date(s):\n\n"
         f"{date_list}\n\n"
         f"Book here:\n{BOOKING_URL}\n\n"
         f"(Alert sent at {datetime.now().strftime('%Y-%m-%d %H:%M')})"
     )
-    print(f"  Sending alerts for: {', '.join(sorted(new_dates))}")
+    print(f"  Sending alerts for: {', '.join(sorted(dates))}")
     send_email(subject, body)
     send_pushover(
         "🚤 Boat trip tickets available!",
-        f"{len(new_dates)} date(s) open: {', '.join(sorted(new_dates))}"
+        f"{len(dates)} date(s) open: {', '.join(sorted(dates))}"
     )
 
 
