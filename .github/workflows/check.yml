@@ -1,8 +1,6 @@
 name: Check Availability
 
 on:
-  schedule:
-    - cron: '0 * * * *'  # runs every hour
   workflow_dispatch:       # lets you run it manually too
   push:
     branches:
